@@ -12,6 +12,7 @@ import { isSupabaseConfigured, supabase } from "../lib/supabase";
 type View = "month" | "week" | "day" | "year" | "tasks";
 type Category = string;
 type Priority = "low" | "medium" | "high";
+type PrintMode = "calendar" | "list" | "planner";
 type CategoryDef = { id: string; name: string; slug: string; color: string; builtIn?: boolean };
 type Profile = { full_name: string; timezone: string; week_starts_on: number; notifications_enabled: boolean };
 type CalendarEvent = {
@@ -51,6 +52,10 @@ function sameDay(a: Date, b: Date) { return a.toDateString() === b.toDateString(
 function monthName(date: Date, full = true) {
   return new Intl.DateTimeFormat("pt-BR", { month: full ? "long" : "short", year: full ? "numeric" : undefined }).format(date);
 }
+function authRedirect(path: string) {
+  const configured = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "");
+  return `${configured || window.location.origin}${path}`;
+}
 function makeDemoEvents(today: Date): CalendarEvent[] {
   const event = (id: string, title: string, offset: number, hour: number, category: Category, extra = {}) => {
     const start = addDays(startOfDay(today), offset); start.setHours(hour);
@@ -88,11 +93,28 @@ export default function CalendarApp() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [categoryOpen, setCategoryOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [printOpen, setPrintOpen] = useState(false);
+  const [welcomeOpen, setWelcomeOpen] = useState(false);
+  const [recoveryOpen, setRecoveryOpen] = useState(false);
+  const [printConfig, setPrintConfig] = useState({ mode: "calendar" as PrintMode, from: isoLocal(new Date(today.getFullYear(), today.getMonth(), 1)).slice(0, 10), to: isoLocal(new Date(today.getFullYear(), today.getMonth() + 1, 0)).slice(0, 10), includeCompleted: true, includeNotes: true });
 
   useEffect(() => {
-    if (!isSupabaseConfigured) return;
-    supabase.auth.getSession().then(({ data }) => { setSession(data.session); setAuthReady(true); });
-    const { data } = supabase.auth.onAuthStateChange((_event, next) => setSession(next));
+    if (!isSupabaseConfigured) {
+      const timer = window.setTimeout(() => {
+        if (localStorage.getItem("lumina-welcome-seen") !== "1") setWelcomeOpen(true);
+      }, 0);
+      return () => window.clearTimeout(timer);
+    }
+    const hash = new URLSearchParams(window.location.hash.slice(1));
+    const isRecoveryLink = hash.get("type") === "recovery" || new URLSearchParams(window.location.search).get("reset") === "true";
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session); setAuthReady(true);
+      if (isRecoveryLink && data.session) {
+        setRecoveryOpen(true);
+        window.history.replaceState({}, "", `${window.location.pathname}?reset=true`);
+      } else if (!data.session && localStorage.getItem("lumina-welcome-seen") !== "1") setWelcomeOpen(true);
+    });
+    const { data } = supabase.auth.onAuthStateChange((event, next) => { setSession(next); if (event === "PASSWORD_RECOVERY") setRecoveryOpen(true); });
     return () => data.subscription.unsubscribe();
   }, []);
 
@@ -269,7 +291,7 @@ export default function CalendarApp() {
             <div className="view-switcher">
               {(["day", "week", "month", "year"] as View[]).map(v => <button key={v} className={view === v ? "active" : ""} onClick={() => setView(v)}>{({ day: "Dia", week: "Semana", month: "Mês", year: "Ano" } as Record<string,string>)[v]}</button>)}
             </div>
-            <button className="print-btn" onClick={() => window.print()}><Printer size={18}/><span>Imprimir</span></button>
+            <button className="print-btn" onClick={() => setPrintOpen(true)}><Printer size={18}/><span>Imprimir</span></button>
           </div>
         </div>
 
@@ -289,6 +311,10 @@ export default function CalendarApp() {
       {profileOpen && <ProfileModal profile={profile} email={session?.user.email ?? ""} onClose={() => setProfileOpen(false)} onSave={saveProfile}/>}
       {categoryOpen && <CategoryModal categories={categories} onClose={() => setCategoryOpen(false)} onAdd={addCategory} onDelete={deleteCategory}/>}
       {settingsOpen && <SettingsModal profile={profile} onClose={() => setSettingsOpen(false)} onSave={saveProfile} onEnableNotifications={enableNotifications} onExport={exportCalendar}/>}
+      {welcomeOpen && !session && <WelcomeModal onExplore={() => { localStorage.setItem("lumina-welcome-seen", "1"); setWelcomeOpen(false); }} onAuth={() => { localStorage.setItem("lumina-welcome-seen", "1"); setWelcomeOpen(false); setAuthOpen(true); }}/>}
+      {printOpen && <PrintModal config={printConfig} onChange={setPrintConfig} onClose={() => setPrintOpen(false)} onPrint={() => { setPrintOpen(false); setTimeout(() => window.print(), 80); }}/>}
+      {recoveryOpen && <ResetPasswordModal onClose={() => setRecoveryOpen(false)} onDone={() => { setRecoveryOpen(false); setToast("Senha atualizada com segurança"); }}/>}
+      <PrintSheet events={visible} cursor={cursor} profile={profile} config={printConfig}/>
       {toast && <div className="toast"><CheckCircle2 size={18}/>{toast}</div>}
     </div>
   );
@@ -359,7 +385,7 @@ function AuthModal({ onClose, onDone }: { onClose: () => void; onDone: () => voi
     if (!isSupabaseConfigured) { setMessage("A demonstração está ativa. Configure o Supabase para entrar."); setLoading(false); return; }
     const result = signup ? await supabase.auth.signUp({
       email, password,
-      options: { data: { full_name: name }, emailRedirectTo: `${window.location.origin}/?confirmed=true` },
+      options: { data: { full_name: name }, emailRedirectTo: authRedirect("/?confirmed=true") },
     }) : await supabase.auth.signInWithPassword({ email, password });
     setLoading(false);
     if (result.error) setMessage(result.error.message === "Invalid login credentials" ? "E-mail ou senha incorretos." : result.error.message);
@@ -369,10 +395,30 @@ function AuthModal({ onClose, onDone }: { onClose: () => void; onDone: () => voi
   async function resetPassword() {
     if (!email) { setMessage("Digite seu e-mail primeiro."); return; }
     setLoading(true);
-    const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: `${window.location.origin}/?reset=true` });
+    const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: authRedirect("/?reset=true") });
     setLoading(false); setMessage(error ? error.message : "Enviamos as instruções para redefinir sua senha.");
   }
-  return <div className="modal-backdrop"><div className="auth-modal"><button className="auth-close" onClick={onClose}><X/></button><div className="auth-brand"><span className="brand-mark"><Sparkles/></span><strong>Lumina</strong></div><h2>{signup ? "Crie seu espaço" : "Que bom ter você de volta"}</h2><p>{signup ? "Seu planejamento, sincronizado e seguro." : "Entre para continuar organizando suas conquistas."}</p><form onSubmit={submit}>{signup && <label><span>Como podemos te chamar?</span><input required value={name} onChange={e => setName(e.target.value)} placeholder="Seu nome"/></label>}<label><span>E-mail</span><input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="voce@email.com"/></label><label><span>Senha</span><input type="password" minLength={6} required value={password} onChange={e => setPassword(e.target.value)} placeholder="Mínimo de 6 caracteres"/></label>{!signup && <button type="button" className="forgot-link" onClick={resetPassword}>Esqueci minha senha</button>}{message && <div className="auth-message">{message}</div>}<button disabled={loading}>{loading ? "Aguarde…" : signup ? "Criar minha conta" : "Entrar"}</button></form><div className="auth-switch">{signup ? "Já possui uma conta?" : "Ainda não tem uma conta?"} <button onClick={() => { setSignup(!signup); setMessage(""); }}>{signup ? "Entrar" : "Criar agora"}</button></div></div></div>;
+  return <div className="modal-backdrop"><div className="auth-modal"><button className="auth-close" onClick={onClose}><X/></button><div className="auth-brand"><span className="brand-mark"><Sparkles/></span><strong>Lumina</strong></div><h2>{signup ? "Crie seu espaço" : "Que bom ter você de volta"}</h2><p>{signup ? "Seu planejamento, sincronizado e seguro." : "Entre para continuar organizando suas conquistas."}</p><form onSubmit={submit}>{signup && <label><span>Como podemos te chamar?</span><input required value={name} onChange={e => setName(e.target.value)} placeholder="Seu nome"/></label>}<label><span>E-mail</span><input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="voce@email.com"/></label><label><span>Senha</span><input type="password" minLength={8} required value={password} onChange={e => setPassword(e.target.value)} placeholder="Mínimo de 8 caracteres"/></label>{!signup && <button type="button" className="forgot-link" onClick={resetPassword}>Esqueci minha senha</button>}{message && <div className="auth-message">{message}</div>}<button disabled={loading}>{loading ? "Aguarde…" : signup ? "Criar minha conta" : "Entrar"}</button></form><div className="auth-switch">{signup ? "Já possui uma conta?" : "Ainda não tem uma conta?"} <button onClick={() => { setSignup(!signup); setMessage(""); }}>{signup ? "Entrar" : "Criar agora"}</button></div></div></div>;
+}
+
+function WelcomeModal({ onExplore, onAuth }: { onExplore: () => void; onAuth: () => void }) {
+  return <div className="modal-backdrop welcome-backdrop"><section className="welcome-modal" aria-labelledby="welcome-title"><button className="auth-close" onClick={onExplore} aria-label="Fechar"><X/></button><div className="welcome-copy"><span className="welcome-kicker"><Sparkles/> BEM-VINDO AO LUMINA</span><h2 id="welcome-title">Seu dia fica mais leve quando tudo está no lugar.</h2><p>Reúna compromissos, tarefas, provas e planos em uma agenda simples de manter — no celular, no computador e também no papel.</p><div className="welcome-benefits"><span><CheckCircle2/> Planeje por dia, semana, mês ou lista</span><span><CheckCircle2/> Receba lembretes e acompanhe prioridades</span><span><CheckCircle2/> Imprima agendas pensadas para usar de verdade</span></div><div className="welcome-actions"><button onClick={onAuth}>Criar conta grátis</button><button className="secondary" onClick={onAuth}>Já tenho uma conta</button></div><button className="explore-link" onClick={onExplore}>Explorar primeiro</button></div><div className="welcome-preview"><div className="preview-date"><strong>{new Date().toLocaleDateString("pt-BR", { day: "2-digit" })}</strong><span>{new Date().toLocaleDateString("pt-BR", { month: "long" })}</span></div><h3>Um plano claro para hoje</h3><div><i/>09:00 <strong>Foco mais importante</strong></div><div><i/>14:00 <strong>Próximo compromisso</strong></div><div><i/>18:30 <strong>Tempo para você</strong></div></div></section></div>;
+}
+
+function ResetPasswordModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
+  const [password, setPassword] = useState(""); const [confirm, setConfirm] = useState(""); const [message, setMessage] = useState(""); const [loading, setLoading] = useState(false);
+  async function submit(event: FormEvent) { event.preventDefault(); if (password.length < 8) { setMessage("Use pelo menos 8 caracteres."); return; } if (password !== confirm) { setMessage("As senhas não coincidem."); return; } setLoading(true); const { error } = await supabase.auth.updateUser({ password }); if (!error) await supabase.auth.signOut({ scope: "global" }); setLoading(false); if (error) setMessage("O link expirou ou não é mais válido. Solicite outro e-mail."); else { window.history.replaceState({}, "", window.location.pathname); onDone(); } }
+  return <div className="modal-backdrop"><form className="auth-modal" onSubmit={submit}><button type="button" className="auth-close" onClick={onClose}><X/></button><div className="auth-brand"><span className="brand-mark"><Sparkles/></span><strong>Lumina</strong></div><h2>Crie uma nova senha</h2><p>Escolha uma senha segura para voltar ao seu planejamento.</p><label><span>Nova senha</span><input autoFocus type="password" minLength={8} value={password} onChange={e => setPassword(e.target.value)}/></label><label><span>Confirmar senha</span><input type="password" minLength={8} value={confirm} onChange={e => setConfirm(e.target.value)}/></label>{message && <div className="auth-message">{message}</div>}<button disabled={loading}>{loading ? "Atualizando…" : "Salvar nova senha"}</button></form></div>;
+}
+
+function PrintModal({ config, onChange, onClose, onPrint }: { config: { mode: PrintMode; from: string; to: string; includeCompleted: boolean; includeNotes: boolean }; onChange: (value: typeof config) => void; onClose: () => void; onPrint: () => void }) {
+  return <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}><section className="small-modal print-modal"><header><div><span>IMPRESSÃO INTELIGENTE</span><h2>Prepare sua agenda em papel</h2></div><button onClick={onClose}><X/></button></header><p className="modal-intro">Escolha um formato conforme o uso. O Lumina ajusta margens, espaços para escrita e informações importantes.</p><div className="print-modes">{([{ id: "calendar", title: "Calendário", text: "Visão mensal compacta" }, { id: "list", title: "Lista", text: "Compromissos em ordem" }, { id: "planner", title: "Planejador", text: "Checklist e espaço para notas" }] as const).map(item => <button key={item.id} className={config.mode === item.id ? "active" : ""} onClick={() => onChange({ ...config, mode: item.id })}><Printer/><strong>{item.title}</strong><span>{item.text}</span></button>)}</div><div className="field-row"><label className="field"><span>De</span><input type="date" value={config.from} onChange={e => onChange({ ...config, from: e.target.value })}/></label><label className="field"><span>Até</span><input type="date" value={config.to} onChange={e => onChange({ ...config, to: e.target.value })}/></label></div><label className="setting-row"><div><strong>Incluir itens concluídos</strong><span>Útil para registros e acompanhamento.</span></div><input type="checkbox" checked={config.includeCompleted} onChange={e => onChange({ ...config, includeCompleted: e.target.checked })}/></label><label className="setting-row"><div><strong>Incluir anotações</strong><span>Descrição e local aparecem na impressão.</span></div><input type="checkbox" checked={config.includeNotes} onChange={e => onChange({ ...config, includeNotes: e.target.checked })}/></label><footer><button className="cancel-btn" onClick={onClose}>Cancelar</button><button className="save-btn" onClick={onPrint}><Printer/> Abrir impressão</button></footer></section></div>;
+}
+
+function PrintSheet({ events, cursor, profile, config }: { events: CalendarEvent[]; cursor: Date; profile: Profile; config: { mode: PrintMode; from: string; to: string; includeCompleted: boolean; includeNotes: boolean } }) {
+  const from = new Date(`${config.from}T00:00:00`); const to = new Date(`${config.to}T23:59:59`); const selected = events.filter(e => new Date(e.start_at) >= from && new Date(e.start_at) <= to && (config.includeCompleted || !e.completed)).sort((a,b) => +new Date(a.start_at) - +new Date(b.start_at)); const monthStart = new Date(cursor.getFullYear(), cursor.getMonth(), 1); const gridStart = addDays(monthStart, -monthStart.getDay()); const days = Array.from({ length: 42 }, (_, i) => addDays(gridStart, i));
+  const groups = selected.reduce<{ key: string; label: string; events: CalendarEvent[] }[]>((result, event) => { const date = new Date(event.start_at); const key = `${date.getFullYear()}-${date.getMonth()}`; const existing = result.find(group => group.key === key); if (existing) existing.events.push(event); else result.push({ key, label: date.toLocaleDateString("pt-BR", { month: "long", year: "numeric" }), events: [event] }); return result; }, []);
+  return <section className={`print-sheet print-${config.mode}`}><header><div><span className="print-logo">✦ Lumina</span><h1>{config.mode === "calendar" ? monthName(cursor) : config.mode === "planner" ? "Planejamento pessoal" : "Lista de compromissos"}</h1><p>{from.toLocaleDateString("pt-BR")} — {to.toLocaleDateString("pt-BR")} · {profile.full_name || "Minha agenda"}</p></div><div className="print-meta"><span>Impresso em</span><strong>{new Date().toLocaleDateString("pt-BR")}</strong></div></header>{config.mode === "calendar" ? <div className="print-calendar"><div className="print-weekdays">{weekdays.map(day => <b key={day}>{day}</b>)}</div><div className="print-month-grid">{days.map(day => <div key={day.toISOString()} className={day.getMonth() !== cursor.getMonth() ? "muted" : ""}><strong>{day.getDate()}</strong>{selected.filter(e => sameDay(new Date(e.start_at), day)).slice(0,4).map(e => <span key={e.id}>□ {e.title}</span>)}</div>)}</div></div> : <div className="print-list">{groups.length ? groups.map(group => <section className="print-month-group" key={group.key}><h2 className="print-month-heading">{group.label}</h2>{group.events.map(event => <article key={event.id}><span className="print-check">□</span><time>{new Date(event.start_at).toLocaleDateString("pt-BR", { weekday: "short", day: "2-digit", month: "short" })}<b>{event.all_day ? "Dia inteiro" : new Date(event.start_at).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}</b></time><div><h2>{event.title}</h2><p>{getCategoryMeta(event.category, event.color).label}{event.location ? ` · ${event.location}` : ""}</p>{config.includeNotes && event.description && <small>{event.description}</small>}{config.mode === "planner" && <div className="writing-lines"><i/><i/></div>}</div></article>)}</section>) : <p className="print-empty">Nenhum compromisso neste período.</p>}</div>}{config.mode === "planner" && <footer className="planner-footer"><div><strong>3 prioridades</strong><i/><i/><i/></div><div><strong>Anotações</strong><i/><i/><i/></div></footer>}<footer className="print-footer">Lumina · Seu tempo, com clareza.</footer></section>;
 }
 
 function NotificationPanel({ alerts, onClose, onOpen, onEnable }: { alerts: CalendarEvent[]; onClose: () => void; onOpen: (event: CalendarEvent) => void; onEnable: () => void }) {
