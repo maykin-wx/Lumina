@@ -50,7 +50,6 @@ compromissos e perfil.
 
 ```bash
 pnpm dev          # desenvolvimento
-pnpm build        # build para Sites/Cloudflare
-pnpm build:vercel # validação do build usado na Vercel
+pnpm build        # build de produção para a Vercel
 pnpm lint         # análise estática
 ```
